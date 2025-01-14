@@ -1,0 +1,20 @@
+[package]
+name = "proc_pidinfo"
+version = "0.1.0"
+edition = "2021"
+description = "A library for accessing process information using proc_pidinfo on macOS"
+authors = ["Matt Mastracci <matthew@mastracci.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mmastrac/proc_pidinfo"
+keywords = ["process", "pidinfo", "proc", "macos"]
+categories = ["os::macos-apis"]
+readme = "README.md"
+
+[lib]
+name = "proc_pidinfo"
+path = "src/lib.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[dependencies]
