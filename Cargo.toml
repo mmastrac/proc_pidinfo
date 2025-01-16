@@ -1,6 +1,6 @@
 [package]
 name = "proc_pidinfo"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A library for accessing process information using proc_pidinfo on macOS"
 authors = ["Matt Mastracci <matthew@mastracci.com>"]
