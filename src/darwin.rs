@@ -1,6 +1,18 @@
 use std::{ffi::OsStr, path::Path};
 
-use libc::{c_int, c_void, c_char};
+use libc::{c_char, c_int, c_void};
+
+/// A wrapper around a process ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct Pid(pub u32);
+
+/// Get the current process ID. This is equivalent to `std::process::id()`.
+pub fn getpid() -> Pid {
+    // SAFETY: We know this is safe to call. The function never fails.
+    let pid = unsafe { libc::getpid() };
+    Pid(pid as _)
+}
 
 /// A wrapper around a file descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,14 +35,21 @@ pub enum ValueError {
 fn libc_str_to_str(array: &[c_char]) -> Result<&str, ValueError> {
     // Find the first NUL, otherwise use the full array
     let nul_index = array.iter().position(|&c| c == 0).unwrap_or(array.len());
-    std::str::from_utf8(unsafe { std::mem::transmute(&array[..nul_index]) }).map_err(|_| ValueError::InvalidString)
+    // SAFETY: We know this is actually u8.
+    std::str::from_utf8(unsafe { std::mem::transmute::<&[c_char], &[u8]>(&array[..nul_index]) })
+        .map_err(|_| ValueError::InvalidString)
 }
 
 /// Convert a C string to a Rust path.
 fn libc_str_to_path(array: &[c_char]) -> Result<&Path, ValueError> {
     // Find the first NUL, otherwise use the full array
     let nul_index = array.iter().position(|&c| c == 0).unwrap_or(array.len());
-    Ok(Path::new(unsafe { OsStr::from_encoded_bytes_unchecked(std::mem::transmute(&array[..nul_index])) }))
+    // SAFETY: We know this is actually u8.
+    Ok(Path::new(unsafe {
+        OsStr::from_encoded_bytes_unchecked(std::mem::transmute::<&[c_char], &[u8]>(
+            &array[..nul_index],
+        ))
+    }))
 }
 
 /// A trait for types that have a flavor.
@@ -197,8 +216,8 @@ pub struct ProcBSDInfo {
     pub pbi_flags: u32,
     pub pbi_status: u32,
     pub pbi_xstatus: u32,
-    pub pbi_pid: u32,
-    pub pbi_ppid: u32,
+    pub pbi_pid: Pid,
+    pub pbi_ppid: Pid,
     pub pbi_uid: libc::uid_t,
     pub pbi_gid: libc::gid_t,
     pub pbi_ruid: libc::uid_t,
@@ -226,8 +245,8 @@ impl HasFlavor for ProcBSDInfo {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ProcBSDShortInfo {
-    pub pbsi_pid: libc::pid_t,
-    pub pbsi_ppid: libc::pid_t,
+    pub pbsi_pid: Pid,
+    pub pbsi_ppid: Pid,
     pub pbsi_pgid: libc::gid_t,
     pub pbsi_status: u32,
     pub pbsi_comm: [c_char; libc::MAXCOMLEN],
@@ -281,17 +300,18 @@ impl HasFlavor for ProcTaskAllInfo {
 /// ```
 /// use proc_pidinfo::*;
 ///
-/// # let pid = std::process::id() as _;
+/// # let pid = getpid();
 /// let info = proc_pidinfo::<ProcBSDShortInfo>(pid).unwrap().unwrap();
 /// println!("{:?}", info);
 /// ```
 #[allow(private_bounds)]
-pub fn proc_pidinfo<T: HasFlavor>(pid: libc::pid_t) -> Result<Option<T>, std::io::Error> {
+pub fn proc_pidinfo<T: HasFlavor>(pid: Pid) -> Result<Option<T>, std::io::Error> {
+    // SAFETY: We check the size of the return value to ensure it's valid.
     unsafe {
         let mut value = std::mem::MaybeUninit::<T>::uninit();
         let buffersize = std::mem::size_of::<T>() as c_int;
         let res = libc::proc_pidinfo(
-            pid,
+            pid.0 as _,
             T::FLAVOR as c_int,
             0,
             value.as_mut_ptr() as *mut c_void,
@@ -304,9 +324,12 @@ pub fn proc_pidinfo<T: HasFlavor>(pid: libc::pid_t) -> Result<Option<T>, std::io
             return Ok(None);
         }
         if res != buffersize {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Unexpected buffer size {res} != {buffersize}")));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unexpected buffer size {res} != {buffersize}"),
+            ));
         }
-        return Ok(Some(value.assume_init()));
+        Ok(Some(value.assume_init()))
     }
 }
 
@@ -314,9 +337,8 @@ pub fn proc_pidinfo<T: HasFlavor>(pid: libc::pid_t) -> Result<Option<T>, std::io
 /// [`proc_pidinfo`] with the current process ID.
 #[allow(private_bounds)]
 pub fn proc_pidinfo_self<T: HasFlavor>() -> Result<Option<T>, std::io::Error> {
-    proc_pidinfo(unsafe { libc::getpid() })
+    proc_pidinfo(getpid())
 }
-
 
 /// Get a list-type info struct for a given process.
 ///
@@ -327,8 +349,8 @@ pub fn proc_pidinfo_self<T: HasFlavor>() -> Result<Option<T>, std::io::Error> {
 ///
 /// ```
 /// use proc_pidinfo::*;
-/// 
-/// # let pid = std::process::id() as _;
+///
+/// # let pid = getpid();
 /// for fd in proc_pidinfo_list::<ProcFDInfo>(pid).unwrap() {
 ///     println!("{:?}", fd);
 ///     if fd.fd_type() == Ok(ProcFDType::VNODE) {
@@ -346,16 +368,11 @@ pub fn proc_pidinfo_self<T: HasFlavor>() -> Result<Option<T>, std::io::Error> {
 /// }
 /// ```
 #[allow(private_bounds)]
-pub fn proc_pidinfo_list<T: HasFlavorList>(pid: libc::pid_t) -> Result<Vec<T>, std::io::Error> {
+pub fn proc_pidinfo_list<T: HasFlavorList>(pid: Pid) -> Result<Vec<T>, std::io::Error> {
+    // SAFETY: We check the size of the return value to ensure it's valid.
     unsafe {
         // First call with NULL to get a suggested buffer size
-        let res = libc::proc_pidinfo(
-            pid,
-            T::FLAVOR as c_int,
-            0,
-            std::ptr::null_mut() as *mut c_void,
-            0,
-        );
+        let res = libc::proc_pidinfo(pid.0 as _, T::FLAVOR as c_int, 0, std::ptr::null_mut(), 0);
         if res < 0 {
             return Err(std::io::Error::from_raw_os_error(res));
         }
@@ -370,7 +387,7 @@ pub fn proc_pidinfo_list<T: HasFlavorList>(pid: libc::pid_t) -> Result<Vec<T>, s
         loop {
             let buffersize = buffer.capacity() as c_int;
             let res = libc::proc_pidinfo(
-                pid,
+                pid.0 as _,
                 T::FLAVOR as c_int,
                 0,
                 buffer.as_mut_ptr() as *mut c_void,
@@ -386,7 +403,10 @@ pub fn proc_pidinfo_list<T: HasFlavorList>(pid: libc::pid_t) -> Result<Vec<T>, s
                 return Err(std::io::Error::from_raw_os_error(res));
             }
             if res as usize % std::mem::size_of::<T>() != 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unexpected buffer size"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Unexpected buffer size",
+                ));
             }
             buffer.set_len(res as usize / std::mem::size_of::<T>());
             return Ok(buffer);
@@ -398,7 +418,7 @@ pub fn proc_pidinfo_list<T: HasFlavorList>(pid: libc::pid_t) -> Result<Vec<T>, s
 /// [`proc_pidinfo_list`] with the current process ID.
 #[allow(private_bounds)]
 pub fn proc_pidinfo_list_self<T: HasFlavorList>() -> Result<Vec<T>, std::io::Error> {
-    proc_pidinfo_list(unsafe { libc::getpid() })
+    proc_pidinfo_list(getpid())
 }
 
 /// General information about a file descriptor. See [`VnodeFdInfo`]
@@ -523,8 +543,8 @@ impl HasFdFlavor for PipeFdInfo {
 ///
 /// ```
 /// use proc_pidinfo::*;
-/// 
-/// # let pid = std::process::id() as _;
+///
+/// # let pid = getpid();
 /// for fd in proc_pidinfo_list::<ProcFDInfo>(pid).unwrap() {
 ///     println!("{:?}", fd);
 ///     if fd.fd_type() == Ok(ProcFDType::VNODE) {
@@ -542,12 +562,12 @@ impl HasFdFlavor for PipeFdInfo {
 /// }
 /// ```
 #[allow(private_bounds)]
-pub fn proc_pidfdinfo<T: HasFdFlavor>(pid: libc::pid_t, fd: Fd) -> Result<Option<T>, std::io::Error> {
+pub fn proc_pidfdinfo<T: HasFdFlavor>(pid: Pid, fd: Fd) -> Result<Option<T>, std::io::Error> {
     unsafe {
         let mut value = std::mem::MaybeUninit::<T>::uninit();
         let buffersize = std::mem::size_of::<T>() as c_int;
         let res = libc::proc_pidfdinfo(
-            pid,
+            pid.0 as _,
             fd.0,
             T::FLAVOR as c_int,
             value.as_mut_ptr() as *mut c_void,
@@ -560,9 +580,12 @@ pub fn proc_pidfdinfo<T: HasFdFlavor>(pid: libc::pid_t, fd: Fd) -> Result<Option
             return Ok(None);
         }
         if res != buffersize {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Unexpected buffer size {res} != {buffersize}")));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unexpected buffer size {res} != {buffersize}"),
+            ));
         }
-        return Ok(Some(value.assume_init()));
+        Ok(Some(value.assume_init()))
     }
 }
 
@@ -571,15 +594,15 @@ pub fn proc_pidfdinfo<T: HasFdFlavor>(pid: libc::pid_t, fd: Fd) -> Result<Option
 /// This is a convenience function that calls [`proc_pidfdinfo`] with the current process ID.
 #[allow(private_bounds)]
 pub fn proc_pidfdinfo_self<T: HasFdFlavor>(fd: Fd) -> Result<Option<T>, std::io::Error> {
-    proc_pidfdinfo(unsafe { libc::getpid() }, fd)
+    proc_pidfdinfo(getpid(), fd)
 }
 
 /// Get an info struct for a given process and fileport.
 ///
 /// ```
 /// use proc_pidinfo::*;
-/// 
-/// # let pid = std::process::id() as _;
+///
+/// # let pid = getpid();
 /// for port in proc_pidinfo_list::<ProcFilePortInfo>(pid).unwrap() {
 ///     println!("{:?}", port);
 ///     if port.fd_type() == Ok(ProcFDType::VNODE) {
@@ -597,12 +620,15 @@ pub fn proc_pidfdinfo_self<T: HasFdFlavor>(fd: Fd) -> Result<Option<T>, std::io:
 /// }
 /// ```
 #[allow(private_bounds)]
-pub fn proc_pidfileportinfo<T: HasFdFlavor>(pid: libc::pid_t, fileport: FilePort) -> Result<Option<T>, std::io::Error> {
+pub fn proc_pidfileportinfo<T: HasFdFlavor>(
+    pid: Pid,
+    fileport: FilePort,
+) -> Result<Option<T>, std::io::Error> {
     unsafe {
         let mut value = std::mem::MaybeUninit::<T>::uninit();
         let buffersize = std::mem::size_of::<T>() as c_int;
         let res = libc::proc_pidfileportinfo(
-            pid,
+            pid.0 as _,
             fileport.0,
             T::FLAVOR as c_int,
             value.as_mut_ptr() as *mut c_void,
@@ -615,9 +641,12 @@ pub fn proc_pidfileportinfo<T: HasFdFlavor>(pid: libc::pid_t, fileport: FilePort
             return Ok(None);
         }
         if res != buffersize {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Unexpected buffer size {res} != {buffersize}")));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unexpected buffer size {res} != {buffersize}"),
+            ));
         }
-        return Ok(Some(value.assume_init()));
+        Ok(Some(value.assume_init()))
     }
 }
 
@@ -625,8 +654,10 @@ pub fn proc_pidfileportinfo<T: HasFdFlavor>(pid: libc::pid_t, fileport: FilePort
 ///
 /// This is a convenience function that calls [`proc_pidfdinfo`] with the current process ID.
 #[allow(private_bounds)]
-pub fn proc_pidfileportinfo_self<T: HasFdFlavor>(fileport: FilePort) -> Result<Option<T>, std::io::Error> {
-    proc_pidfileportinfo(unsafe { libc::getpid() }, fileport)
+pub fn proc_pidfileportinfo_self<T: HasFdFlavor>(
+    fileport: FilePort,
+) -> Result<Option<T>, std::io::Error> {
+    proc_pidfileportinfo(getpid(), fileport)
 }
 
 #[cfg(test)]
@@ -635,24 +666,26 @@ mod tests {
 
     #[test]
     fn test_proc_pidinfo_pid_zero() {
-        let result = proc_pidinfo_list::<ProcFDInfo>(0).unwrap();
+        let result = proc_pidinfo_list::<ProcFDInfo>(Pid(0)).unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_proc_pidinfo_fileport_zero() {
-        let result = proc_pidinfo_list::<ProcFilePortInfo>(0).unwrap();
+        let result = proc_pidinfo_list::<ProcFilePortInfo>(Pid(0)).unwrap();
         assert!(result.is_empty());
     }
 
     // This will work if launchd is process 1 and you run w/sudo
     #[test]
     fn test_proc_pidinfo_fileport_one() {
-        let result = proc_pidinfo_list::<ProcFilePortInfo>(1).unwrap();
+        let result = proc_pidinfo_list::<ProcFilePortInfo>(Pid(1)).unwrap();
         for port in result {
             println!("{:?}", port);
             if port.fd_type() == Ok(ProcFDType::VNODE) {
-                let vnode = proc_pidfileportinfo::<VnodeFdInfo>(1, port.proc_fileport).unwrap().unwrap();
+                let vnode = proc_pidfileportinfo::<VnodeFdInfo>(Pid(1), port.proc_fileport)
+                    .unwrap()
+                    .unwrap();
                 println!("{:?}", vnode);
             }
         }
@@ -663,9 +696,12 @@ mod tests {
         let result = proc_pidinfo_list_self::<ProcFDInfo>().unwrap();
         for fd in result {
             if fd.fd_type() == Ok(ProcFDType::VNODE) {
-                let vnode = proc_pidfdinfo_self::<VnodeFdInfo>(fd.proc_fd).unwrap().unwrap();
+                let vnode = proc_pidfdinfo_self::<VnodeFdInfo>(fd.proc_fd)
+                    .unwrap()
+                    .unwrap();
                 println!("{:?}", vnode);
-                if let Some(vnode) = proc_pidfdinfo_self::<VnodeFdInfoWithPath>(fd.proc_fd).unwrap() {
+                if let Some(vnode) = proc_pidfdinfo_self::<VnodeFdInfoWithPath>(fd.proc_fd).unwrap()
+                {
                     println!("Path: {:?}", vnode.path().unwrap());
                 }
             } else {
@@ -680,9 +716,13 @@ mod tests {
         let result = proc_pidinfo_list_self::<ProcFilePortInfo>().unwrap();
         for port in result {
             if port.fd_type() == Ok(ProcFDType::VNODE) {
-                let vnode = proc_pidfileportinfo_self::<VnodeFdInfo>(port.proc_fileport).unwrap().unwrap();
+                let vnode = proc_pidfileportinfo_self::<VnodeFdInfo>(port.proc_fileport)
+                    .unwrap()
+                    .unwrap();
                 println!("{:?}", vnode);
-                if let Some(vnode) = proc_pidfileportinfo_self::<VnodeFdInfoWithPath>(port.proc_fileport).unwrap() {
+                if let Some(vnode) =
+                    proc_pidfileportinfo_self::<VnodeFdInfoWithPath>(port.proc_fileport).unwrap()
+                {
                     println!("Path: {:?}", vnode.path().unwrap());
                 }
             } else {
@@ -695,21 +735,21 @@ mod tests {
     #[test]
     fn test_proc_task_info_self() {
         let result = proc_pidinfo_self::<ProcTaskAllInfo>().unwrap().unwrap();
-        assert_eq!(result.pbsd.pbi_pid, unsafe { libc::getpid() } as u32);
+        assert_eq!(result.pbsd.pbi_pid, getpid());
         println!("{:?}", result);
     }
 
     #[test]
     fn test_proc_task_info_short_self() {
         let result = proc_pidinfo_self::<ProcBSDShortInfo>().unwrap().unwrap();
-        assert_eq!(result.pbsi_pid, std::process::id() as _);
+        assert_eq!(result.pbsi_pid, getpid());
         println!("{:?}", result);
     }
 
     #[test]
     fn test_proc_task_info_short_zero() {
-        let result = proc_pidinfo::<ProcBSDShortInfo>(0).unwrap().unwrap();
-        assert_eq!(result.pbsi_pid, 0);
+        let result = proc_pidinfo::<ProcBSDShortInfo>(Pid(0)).unwrap().unwrap();
+        assert_eq!(result.pbsi_pid, Pid(0));
         println!("{:?}", result);
         println!("{}", result.comm().unwrap());
     }
