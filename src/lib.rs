@@ -1,11 +1,12 @@
-#![doc = include_str!("../README.md")]
 #![cfg_attr(
-    not(target_os = "macos"),
-    doc = "NOTE: This library is only supported on macOS and iOS."
+    not(target_vendor = "apple"),
+    doc = "NOTE: This library is only supported on macOS, iOS and other Apple platforms."
 )]
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#![cfg_attr(target_vendor = "apple", doc = include_str!("../README.md"))]
+
+#[cfg(target_vendor = "apple")]
 pub use darwin::*;
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_vendor = "apple")]
 mod darwin;
